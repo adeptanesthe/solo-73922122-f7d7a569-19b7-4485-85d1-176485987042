@@ -31,9 +31,13 @@
     .chunks { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr));
               gap:8px; max-height:340px; overflow:auto; padding:4px; }
     .chunk { border-radius:8px; padding:8px 6px; font-size:12px; text-align:center;
-             border:1px solid var(--line); background:#f0fdf4; cursor:pointer; }
+             border:1px solid var(--line); cursor:pointer; }
+    .chunk.ready { background:#f0fdf4; }
     .chunk.off { background:#fef2f2; border-color:#fecaca; color:var(--red); }
+    .chunk.pending { background:#fefce8; border-color:#fde68a; color:#a16207; }
+    .chunk.failed { background:#faf5ff; border-color:#d8b4fe; color:#7e22ce; }
     .chunk b { display:block; font-size:13px; }
+    .retry { color:#7e22ce; font-weight:600; }
     .stats { font-size:13px; background:#f1f5f9; border-radius:6px; padding:8px 12px;
              margin-top:10px; }
     audio { width:100%; margin-top:10px; }

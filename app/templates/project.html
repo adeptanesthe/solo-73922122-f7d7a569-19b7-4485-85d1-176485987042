@@ -16,8 +16,14 @@
       <td>{{ state.a }}</td>
     </tr>
   </table>
+  <div id="prep" class="stats">
+    摘要后台准备：就绪 <b id="p-ready">0</b> / <span id="p-total">{{ state.n_chunks }}</span>
+    块，准备中 <b id="p-pending">0</b> 块，失败 <b id="p-failed">0</b> 块
+    <span id="p-done" class="ok" style="display:none">（全部就绪）</span>
+  </div>
   <p class="muted" style="margin-top:8px">
-    绿色为保留块，红色为撤下块。点击方块即可撤下 / 恢复，操作只读写树摘要，不读取原始样点。
+    绿色=保留且摘要就绪，黄色=保留但摘要准备中，紫色=保留但准备失败，红色描边=已撤下。
+    点击方块即可撤下 / 恢复，操作只读写树摘要，不读取原始样点；摘要在后台逐块准备，边准备边剪。
   </p>
   <div id="chunks" class="chunks"></div>
   <div id="toggle-stats" class="stats" style="display:none"></div>
@@ -28,6 +34,10 @@
   <label for="k">输入成片样点号（从 0 起算，有效范围 0 .. <span id="kmax">{{ state.kept_samples - 1 }}</span>）</label>
   <input id="k" type="number" min="0" style="max-width:260px" placeholder="例如 0、4096、10000">
   <button id="btn-audition" type="button">定位并试听</button>
+  <p class="muted" style="margin-top:6px">
+    目标块之前仍保留的块必须摘要就绪；未就绪时会提示“准备中/准备失败”并收起播放器。
+    目标块自身直接读 PCM，每次请求最多读一次。
+  </p>
   <div id="audition-meta" class="stats" style="display:none"></div>
   <audio id="player" controls style="display:none"></audio>
 </div>
@@ -37,6 +47,7 @@
 <script>
 const PID = {{ state.id | tojson }};
 let state = {{ state | tojson }};
+let pollTimer = null;
 
 const bannerEl = document.getElementById("banner");
 function banner(msg, kind) {
@@ -44,20 +55,66 @@ function banner(msg, kind) {
   bannerEl.className = "banner show " + (kind === "err" ? "err" : "info");
 }
 function clearBanner() { bannerEl.className = "banner"; bannerEl.textContent = ""; }
+function hidePlayer() {
+  const player = document.getElementById("player");
+  player.removeAttribute("src");
+  player.style.display = "none";
+  document.getElementById("audition-meta").style.display = "none";
+}
+
+function chunkClass(c) {
+  if (!c.active) return "chunk off";
+  if (c.status === "ready") return "chunk ready";
+  if (c.status === "failed") return "chunk failed";
+  return "chunk pending";
+}
+function chunkLabel(c) {
+  if (!c.active) return "撤下";
+  if (c.status === "ready") return "保留·就绪";
+  if (c.status === "failed") return "保留·失败";
+  return "保留·准备中";
+}
 
 function renderChunks() {
   const box = document.getElementById("chunks");
   box.innerHTML = "";
   state.chunks.forEach(c => {
     const d = document.createElement("div");
-    d.className = "chunk" + (c.active ? "" : " off");
-    d.innerHTML = "<b>#" + c.index + "</b>" +
-      (c.active ? "保留" : "撤下") + "<br>" + c.samples + " 样点";
-    d.onclick = () => toggle(c.index, c.active);
+    d.className = chunkClass(c);
+    const tip = c.error ? ` 失败原因：${c.error}` : "";
+    d.title = `#${c.index} ${chunkLabel(c)}${tip}`;
+    d.innerHTML = "<b>#" + c.index + "</b>" + chunkLabel(c) +
+      "<br>" + c.samples + " 样点" +
+      (c.status === "failed" && c.active ? "<br><span class='retry'>点此重试</span>" : "");
+    d.onclick = () => {
+      if (c.status === "failed" && c.active) {
+        retry(c.index);
+      } else {
+        toggle(c.index, c.active);
+      }
+    };
     box.appendChild(d);
   });
   document.getElementById("t-kept").textContent = state.kept_samples;
   document.getElementById("kmax").textContent = Math.max(0, state.kept_samples - 1);
+  const sm = state.summary;
+  document.getElementById("p-ready").textContent = sm.ready;
+  document.getElementById("p-pending").textContent = sm.pending;
+  document.getElementById("p-failed").textContent = sm.failed;
+  document.getElementById("p-done").style.display = sm.all_ready ? "inline" : "none";
+}
+
+async function refreshState() {
+  try {
+    const resp = await fetch(`/api/p/${PID}/state`);
+    if (!resp.ok) return;
+    state = await resp.json();
+    renderChunks();
+    if (state.summary.pending === 0 && pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  } catch (e) { /* 轮询失败忽略，下一拍再试 */ }
 }
 
 async function toggle(i, currentlyActive) {
@@ -71,25 +128,43 @@ async function toggle(i, currentlyActive) {
   if (!resp.ok) { banner(data.error || "操作失败", "err"); return; }
   state = data.state;
   renderChunks();
+  hidePlayer();
   const s = data.stats;
   const el = document.getElementById("toggle-stats");
   el.style.display = "block";
   el.innerHTML = `块 #${i} 已${currentlyActive ? "撤下" : "恢复"}：本次访问摘要
     <b>${s.summary_touches}</b> 个，读取原始块 <b>${s.chunk_loads}</b> 个
-    （总块数 ${state.n_chunks}，摘要访问量随总块数对数增长）`;
+    （总块数 ${state.n_chunks}，摘要访问量随总块数对数增长；撤/恢复不读 PCM）`;
+}
+
+async function retry(i) {
+  clearBanner();
+  const resp = await fetch(`/api/p/${PID}/chunks/${i}/retry`, {method: "POST"});
+  const data = await resp.json();
+  if (!resp.ok) { banner(data.error || "重试失败", "err"); return; }
+  state = data.state;
+  renderChunks();
+  banner(`块 #${i} 已重新排队准备`, "info");
+  if (!pollTimer && state.summary.pending > 0) {
+    pollTimer = setInterval(refreshState, 700);
+  }
 }
 
 document.getElementById("btn-audition").onclick = async () => {
   clearBanner();
+  hidePlayer();
   const kRaw = document.getElementById("k").value.trim();
   const k = Number(kRaw);
   if (!Number.isInteger(k) || k < 0) { banner("请输入非负整数样点号", "err"); return; }
   const resp = await fetch(`/api/p/${PID}/audition?k=${k}`);
   const data = await resp.json();
   if (!resp.ok) {
-    banner(data.error || "时码越界，请重新选择", "err");
-    document.getElementById("player").style.display = "none";
-    document.getElementById("audition-meta").style.display = "none";
+    if (resp.status === 409) {
+      banner(data.error || "摘要未就绪，跳听被阻塞", "err");
+    } else {
+      banner(data.error || "时码越界，请重新选择", "err");
+    }
+    hidePlayer();
     return;
   }
   const meta = document.getElementById("audition-meta");
@@ -105,5 +180,8 @@ document.getElementById("btn-audition").onclick = async () => {
 };
 
 renderChunks();
+if (state.summary.pending > 0) {
+  pollTimer = setInterval(refreshState, 700);
+}
 </script>
 {% endblock %}

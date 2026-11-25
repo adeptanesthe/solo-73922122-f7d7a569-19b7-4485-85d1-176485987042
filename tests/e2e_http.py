@@ -1,17 +1,19 @@
 """真实 HTTP 端到端验证（针对运行中的 Flask 服务）。
 
 步骤：
-1. 上传示例录音 interview_demo.wav（a=0.9）；
-2. 撤下全部停顿块，再恢复其中一块，检查摘要访问量与原始块读取次数；
-3. 对若干成片时码（含块首/块中/最后一个样点）跳听，定位结果与 WAV 校验；
-4. 独立做“先拼接保留样点、从零状态顺序滤波再量化”，与所有跳听段逐样点比对；
-5. 越界时码返回 400 与重选提示。
+1. 上传示例录音 interview_demo.wav（a=0.9），确认建工程后摘要在后台逐块准备；
+2. 若服务设置了 CLIP_SUMMARY_DELAY（慢准备模式），先验证未就绪跳听返回 409；
+3. 轮询状态直到全部就绪；撤下全部停顿块，再恢复其中一块，检查访问计数；
+4. 对若干成片时码（含块首/块中/最后一个样点）跳听，定位结果与 WAV 校验；
+5. 独立做“先拼接保留样点、从零状态顺序滤波再量化”，与所有跳听段逐样点比对；
+6. 越界时码返回 400 与重选提示。
 """
 from __future__ import annotations
 
 import io
 import json
 import sys
+import time
 import urllib.request
 import wave
 
@@ -54,6 +56,19 @@ def multipart(fields: dict[str, str], file_field: str, filename: str, content: b
     return b"".join(lines), {"Content-Type": f"multipart/form-data; boundary={boundary}"}
 
 
+def wait_state(pid: str, timeout: float = 30.0):
+    deadline = time.time() + timeout
+    st = None
+    while time.time() < deadline:
+        status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/state")
+        assert status == 200
+        st = json.loads(raw)
+        if st["summary"]["all_ready"]:
+            return st
+        time.sleep(0.1)
+    raise AssertionError(f"摘要准备超时：{st['summary'] if st else '无状态'}")
+
+
 def main() -> None:
     failures = []
 
@@ -69,7 +84,7 @@ def main() -> None:
         total = wf.getnframes()
         pcm_all = np.frombuffer(wf.readframes(total), dtype="<i2").copy()
 
-    print("[1] 上传示例录音")
+    print("[1] 上传示例录音：PCM 落盘即建工程，摘要后台逐块准备")
     body, hdrs = multipart({"a": A}, "wav", "interview_demo.wav", wav_bytes)
     status, _b, h = http("POST", f"{BASE}/upload", body, hdrs)
     check(status == 302, f"上传 302（实得 {status}）")
@@ -77,11 +92,33 @@ def main() -> None:
     print(f"      工程 id = {pid}")
 
     status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/state")
-    st = json.loads(raw)
-    check(st["n_chunks"] == 40 and st["kept_samples"] == total,
-          f"40 块、全保留 {total} 样点（实得 {st['n_chunks']}/{st['kept_samples']}）")
+    st0 = json.loads(raw)
+    check(st0["n_chunks"] == 40 and st0["kept_samples"] == total,
+          f"40 块、全保留 {total} 样点（实得 {st0['n_chunks']}/{st0['kept_samples']}）")
+    check(st0["summary"]["total"] == 40 and st0["summary"]["ready"] <= 40,
+          "状态接口给出 40 块的准备进度（ready/pending/failed 计数齐全）")
+    check(set(st0["summary"]) == {"ready", "pending", "failed", "total", "all_ready"},
+          "摘要进度字段齐全")
 
-    print("[2] 撤下 7 个停顿块 + 恢复 1 块")
+    print("[2] 慢准备模式下未就绪跳听返回 409（若服务已跑完则跳过）")
+    if not st0["summary"]["all_ready"]:
+        # 找一个未就绪的保留块，用它的成片起点跳听
+        pending_chunk = next(c["index"] for c in st0["chunks"] if c["status"] == "pending")
+        k_pending = pending_chunk * 4096
+        status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/audition?k={k_pending}")
+        d = json.loads(raw)
+        check(status == 409 and d["blocking_status"] == "pending",
+              f"未就绪位置跳听 409 准备中（实得 {status}/{d.get('blocking_status')}）")
+        check("blocking_chunk" in d, "409 响应带阻塞块号，供前端收起播放器")
+    else:
+        print("      服务未启用慢准备，上传即就绪，跳过 409 实测（test_web.py 已覆盖）")
+
+    print("[3] 轮询等待后台摘要全部就绪")
+    st = wait_state(pid)
+    check(st["summary"] == {"ready": 40, "pending": 0, "failed": 0, "total": 40, "all_ready": True},
+          f"40 块全部就绪（实得 {st['summary']}）")
+
+    print("[4] 撤下 7 个停顿块 + 恢复 1 块：不读 PCM、摘要访问对数级")
     max_touch = 0
     for i in SILENT:
         status, raw, _ = http("POST", f"{BASE}/api/p/{pid}/chunks/{i}/toggle",
@@ -101,7 +138,7 @@ def main() -> None:
     check(st["kept_samples"] == total - 4096 * len(off),
           f"成片样点 = 总量 - {len(off)} 块")
 
-    print("[3] 独立参考实现：先拼接、顺序滤波、再量化")
+    print("[5] 独立参考实现：先拼接、顺序滤波、再量化")
     kept = np.concatenate([
         pcm_all[b * 4096:(b + 1) * 4096] for b in range(40) if b not in off
     ]).astype(np.float64)
@@ -113,8 +150,7 @@ def main() -> None:
         y[n] = s
     ref = np.clip(np.rint(y), -32768, 32767).astype(np.int16)
 
-    print("[4] 跳听：定位、长度、量化误差 ≤ 1、原始块只读 1 个")
-    # 覆盖每个保留块块首 + 块中几个点 + 末样点
+    print("[6] 跳听：定位、长度、量化误差 ≤ 1、原始块只读 1 个")
     ks = [0]
     cursor = 0
     block_starts = []
@@ -148,19 +184,17 @@ def main() -> None:
     check(worst <= 1, f"全部 {len(ks)} 个时码最大量化差 {worst} ≤ 1")
     print(f"      对照 {len(ks)} 个时码，逐样点最大差 = {worst}")
 
-    print("[5] 定位语义抽查")
-    # 成片 0 号 -> 块 0 偏移 0；跳过撤块后第一个接缝 -> 块 5 偏移 0
+    print("[7] 定位语义抽查")
     status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/audition?k=0")
     m0 = json.loads(raw)
     check((m0["chunk"], m0["offset"]) == (0, 0), "k=0 -> (块0, 偏移0)")
-    # 块 0..3 保留(3 在 off!) 实际 off=[3,4,9,17,25,32]
-    # 保留序列：0,1,2 | 5,6,7,8 | 10,... 块5 的成片起点 = 3*4096
+    # off=[3,4,9,17,25,32]；保留序列 0,1,2 | 5,6,7,8 | 10,... 块5 的成片起点 = 3*4096
     k5 = 3 * 4096
     status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/audition?k={k5}")
     m5 = json.loads(raw)
     check((m5["chunk"], m5["offset"]) == (5, 0), f"k={k5} -> (块5, 偏移0)，实得 ({m5['chunk']},{m5['offset']})")
 
-    print("[6] 越界提示")
+    print("[8] 越界提示")
     for bad in (ref.shape[0], ref.shape[0] + 999):
         status, raw, _ = http("GET", f"{BASE}/api/p/{pid}/audition?k={bad}")
         d = json.loads(raw)

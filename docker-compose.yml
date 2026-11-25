@@ -4,6 +4,9 @@ services:
     image: clip-lab:latest
     ports:
       - "5000:5000"
+    environment:
+      # 每块摘要准备之间的延迟（秒）：演示“边准备边剪”用，生产可置 0
+      CLIP_SUMMARY_DELAY: "0.15"
     volumes:
       - clip-data:/data
     restart: unless-stopped
